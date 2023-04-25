@@ -1,6 +1,6 @@
-链上交易分析
+链上交易安全分析及相关POC编写
 
-PS：本文章参考了Github上的DeFiHackLabs相关文章，写的很好，表示感谢。
+PS：本文章参考了Github上的DeFiHackLabs相关文章，链接在<a href="https://github.com/SunWeb3Sec/DeFiHackLabs">这里</a>。写的很好，从中受益良多，真心表示感谢。以下记录了我学习过程中的笔记。
 
 # 1. Warm Up
 
